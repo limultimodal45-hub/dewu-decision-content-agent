@@ -4,10 +4,12 @@ from pathlib import Path
 
 import altair as alt
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 from dewu_agent import (
     analyze_high_exposure_low_decision,
+    build_decision_value_matrix,
     compare_real_experience_vs_cliche,
     diagnose_conversion_drop,
     extract_filters,
@@ -131,6 +133,77 @@ def render_result_tables(tables: dict[str, pd.DataFrame]) -> None:
         st.dataframe(table, width="stretch")
 
 
+def render_decision_value_matrix(df: pd.DataFrame, filters: dict) -> None:
+    st.header("内容决策价值矩阵：找出虚热内容和被埋没的决策内容")
+    st.write(
+        "得物社区的问题不只是内容质量高低，而是曝光资源是否分配给了真正帮助用户决策的内容。"
+        "这个矩阵把内容放到“曝光占用程度 × 购买决策价值”两个维度中，帮助运营识别两类关键对象："
+        "一类是获得很多曝光但没有推动购买决策的虚热内容，另一类是决策价值高但没有被充分分发的被埋没内容。"
+    )
+    st.caption(
+        "横轴表示曝光占用程度，纵轴表示购买决策价值。矩阵不是判断内容真假，而是判断曝光资源是否分配给了真正帮助用户购买决策的内容。"
+    )
+
+    matrix_result = build_decision_value_matrix(df, filters=filters)
+    matrix_df = matrix_result["matrix_df"]
+    exposure_threshold = matrix_result["exposure_threshold"]
+    decision_threshold = matrix_result["decision_threshold"]
+    counts = matrix_result["summary"]["quadrant_counts"]
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("被埋没的决策内容", f"{counts.get('被埋没的决策内容', 0)} 条")
+    metric_cols[1].metric("虚热内容 / 曝光资源错配", f"{counts.get('虚热内容 / 曝光资源错配', 0)} 条")
+    metric_cols[2].metric("已验证样板内容", f"{counts.get('已验证样板内容', 0)} 条")
+    metric_cols[3].metric("低优先级观察内容", f"{counts.get('低优先级观察内容', 0)} 条")
+
+    fig = px.scatter(
+        matrix_df,
+        x="exposure",
+        y="decision_value_score",
+        color="quadrant",
+        hover_data=[
+            "content_id",
+            "brand",
+            "content_type",
+            "product_card_click_rate",
+            "product_detail_uv_rate",
+            "purchase_conversion_rate",
+            "cancel_return_rate",
+        ],
+        title="Decision Value × Exposure Allocation Matrix",
+    )
+    fig.add_vline(x=exposure_threshold, line_dash="dash")
+    fig.add_hline(y=decision_threshold, line_dash="dash")
+    fig.update_layout(
+        xaxis_title="曝光量 / 曝光占用程度",
+        yaxis_title="购买决策价值分",
+        legend_title_text="象限",
+        height=560,
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    tab_names = [
+        "被埋没的决策内容",
+        "虚热内容 / 曝光资源错配",
+        "已验证样板内容",
+        "低优先级观察内容",
+    ]
+    list_keys = [
+        "buried_decision_content",
+        "overheated_mismatch_content",
+        "verified_sample_content",
+        "low_priority_content",
+    ]
+    tabs = st.tabs(tab_names)
+    for tab, key in zip(tabs, list_keys):
+        with tab:
+            table = matrix_result["lists"][key]
+            if table.empty:
+                st.info("当前筛选条件下没有符合该象限特征的内容。")
+            else:
+                st.dataframe(table, width="stretch", hide_index=True)
+
+
 def render_diagnosis_block(diagnosis: dict, rule_based: bool = False) -> None:
     title = "规则版诊断" if rule_based else "GPT 动态诊断"
     st.subheader(title)
@@ -213,6 +286,8 @@ def render_routed_result(question: str, route: dict, df: pd.DataFrame, enable_gp
         render_diagnosis_block(diagnosis, rule_based=not diagnosis.get("enabled"))
     else:
         render_diagnosis_block(build_rule_diagnosis(analysis_result), rule_based=True)
+
+    render_decision_value_matrix(df, analysis_result.get("filters_used", filters))
 
 
 def set_example_question(example: str) -> None:

@@ -449,3 +449,120 @@ def diagnose_conversion_drop(df: pd.DataFrame, filters: dict | None = None) -> d
         filter_warning=filter_warning,
         extra={"funnel_table": funnel_table, "diagnosis": diagnosis},
     )
+
+
+MATRIX_COLUMNS = [
+    "content_id",
+    "brand",
+    "content_type",
+    "exposure",
+    "decision_value_score",
+    "product_card_click_rate",
+    "product_detail_uv_rate",
+    "purchase_conversion_rate",
+    "cancel_return_rate",
+    "quadrant",
+    "action_reason",
+]
+
+
+def _matrix_reason(quadrant: str) -> str:
+    reasons = {
+        "已验证样板内容": "该内容已获得较高曝光，且决策价值分高于当前样本中位数，可作为同类内容样板观察。",
+        "被埋没的决策内容": "该内容决策价值分较高，但曝光低于当前样本中位数，说明可能存在优质决策内容未被充分分发，建议增加交易导向曝光。",
+        "虚热内容 / 曝光资源错配": "该内容曝光高于当前样本中位数，但决策价值分偏低，说明它占用了曝光资源却没有有效推动购买决策，建议减少增量曝光或运营复查。",
+        "低优先级观察内容": "该内容当前曝光和决策价值均不突出，暂不占用运营处理资源，继续观察。",
+    }
+    return reasons.get(quadrant, "暂不处理，继续观察。")
+
+
+def _prepare_matrix_table(df: pd.DataFrame) -> pd.DataFrame:
+    table = df.copy()
+    for column in MATRIX_COLUMNS:
+        if column not in table.columns:
+            table[column] = pd.NA
+    table = table[MATRIX_COLUMNS].copy()
+    if "exposure" in table:
+        table["exposure"] = pd.to_numeric(table["exposure"], errors="coerce").round(0).astype("Int64")
+    if "decision_value_score" in table:
+        table["decision_value_score"] = pd.to_numeric(table["decision_value_score"], errors="coerce").round(3)
+    for column in [
+        "product_card_click_rate",
+        "product_detail_uv_rate",
+        "purchase_conversion_rate",
+        "cancel_return_rate",
+    ]:
+        table[column] = pd.to_numeric(table[column], errors="coerce").round(4)
+    return table
+
+
+def build_decision_value_matrix(df: pd.DataFrame, filters: dict | None = None) -> dict:
+    """Build a four-quadrant content decision value matrix from filtered data."""
+
+    filtered = apply_filters(df, filters)
+    if isinstance(filtered, tuple):
+        df_filtered = filtered[0]
+    elif isinstance(filtered, dict):
+        df_filtered = filtered.get("df_filtered") or filtered.get("data") or df.copy()
+    else:
+        df_filtered = filtered
+
+    df_filtered = df_filtered.copy()
+    exposure_threshold = df_filtered["exposure"].median()
+    decision_threshold = df_filtered["decision_value_score"].median()
+
+    high_exposure = df_filtered["exposure"] >= exposure_threshold
+    high_decision = df_filtered["decision_value_score"] >= decision_threshold
+
+    df_filtered["quadrant"] = "低优先级观察内容"
+    df_filtered.loc[high_exposure & high_decision, "quadrant"] = "已验证样板内容"
+    df_filtered.loc[~high_exposure & high_decision, "quadrant"] = "被埋没的决策内容"
+    df_filtered.loc[high_exposure & ~high_decision, "quadrant"] = "虚热内容 / 曝光资源错配"
+    df_filtered["action_reason"] = df_filtered["quadrant"].map(_matrix_reason)
+
+    matrix_df = _prepare_matrix_table(df_filtered)
+    quadrant_counts = matrix_df["quadrant"].value_counts().to_dict()
+
+    buried = (
+        matrix_df[matrix_df["quadrant"] == "被埋没的决策内容"]
+        .sort_values(
+            ["decision_value_score", "product_card_click_rate", "purchase_conversion_rate"],
+            ascending=[False, False, False],
+        )
+        .head(10)
+    )
+    overheated = (
+        matrix_df[matrix_df["quadrant"] == "虚热内容 / 曝光资源错配"]
+        .sort_values(
+            ["exposure", "decision_value_score", "product_card_click_rate"],
+            ascending=[False, True, True],
+        )
+        .head(10)
+    )
+    verified = (
+        matrix_df[matrix_df["quadrant"] == "已验证样板内容"]
+        .sort_values(["decision_value_score", "exposure"], ascending=[False, False])
+        .head(10)
+    )
+    low_priority = (
+        matrix_df[matrix_df["quadrant"] == "低优先级观察内容"]
+        .sort_values(["exposure"], ascending=[False])
+        .head(10)
+    )
+
+    return {
+        "matrix_df": matrix_df,
+        "exposure_threshold": exposure_threshold,
+        "decision_threshold": decision_threshold,
+        "summary": {
+            "filtered_rows": len(df_filtered),
+            "quadrant_counts": quadrant_counts,
+            "filter_warning": getattr(df_filtered, "attrs", {}).get("filter_warning"),
+        },
+        "lists": {
+            "buried_decision_content": buried,
+            "overheated_mismatch_content": overheated,
+            "verified_sample_content": verified,
+            "low_priority_content": low_priority,
+        },
+    }
