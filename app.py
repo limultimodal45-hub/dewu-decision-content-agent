@@ -16,6 +16,7 @@ from dewu_agent import (
     route_question,
 )
 from gpt_diagnosis import generate_gpt_diagnosis, has_openai_api_key
+from game_simulator import PRESET_PARAMS, simulate_content_game
 
 
 DATA_PATH = Path("data/dewu_decision_content_mock.csv")
@@ -204,6 +205,158 @@ def render_decision_value_matrix(df: pd.DataFrame, filters: dict) -> None:
                 st.dataframe(table, width="stretch", hide_index=True)
 
 
+def render_content_game_sandbox(df: pd.DataFrame, filters: dict) -> None:
+    st.header("内容激励博弈沙盘：平台规则如何改变创作者供给与用户信任")
+    st.write(
+        "上面的内容决策价值矩阵是静态诊断，回答“当前哪些内容被高估或被低估”。"
+        "这个沙盘进一步模拟：如果平台调整曝光激励规则，创作者会更倾向于生产哪类内容，"
+        "以及用户信任、搜索成本和曝光错配可能如何变化。"
+    )
+    st.caption(
+        "边界说明：该模块不调用 GPT，不做真实预测，也不能替代 A/B 实验。"
+        "它只是用规则化收益函数，把平台激励、创作者策略和用户后续行为之间的关系做成可解释演示。"
+    )
+
+    preset_name = st.selectbox("选择平台激励预设", list(PRESET_PARAMS.keys()), index=2)
+    preset = PRESET_PARAMS[preset_name]
+
+    with st.expander("调整平台规则参数", expanded=False):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            w_shallow = st.slider("浅层互动权重", 0.0, 1.0, float(preset["w_shallow"]), 0.01)
+            w_text_signal = st.slider("文本真实感权重", 0.0, 1.0, float(preset["w_text_signal"]), 0.01)
+            w_product_click = st.slider("商品点击权重", 0.0, 1.0, float(preset["w_product_click"]), 0.01)
+            w_decision_depth = st.slider("决策深度权重", 0.0, 1.0, float(preset["w_decision_depth"]), 0.01)
+            w_conversion = st.slider("下单转化权重", 0.0, 1.0, float(preset["w_conversion"]), 0.01)
+        with col_b:
+            w_return_penalty = st.slider("取消/退货惩罚", 0.0, 1.0, float(preset["w_return_penalty"]), 0.01)
+            exploration_ratio = st.slider("优质低曝光探索比例", 0.0, 0.30, float(preset["exploration_ratio"]), 0.01)
+            adaptation_speed = st.slider("创作者适应速度", 0.05, 0.80, float(preset["adaptation_speed"]), 0.01)
+            template_arbitrage_tendency = st.slider(
+                "模板套利倾向", 0.0, 1.0, float(preset["template_arbitrage_tendency"]), 0.01
+            )
+            user_trust_sensitivity = st.slider(
+                "用户信任敏感度", 0.0, 1.0, float(preset["user_trust_sensitivity"]), 0.01
+            )
+            rounds = st.slider("模拟轮数", 3, 12, int(preset["rounds"]), 1)
+
+    params = {
+        **preset,
+        "w_shallow": w_shallow,
+        "w_text_signal": w_text_signal,
+        "w_product_click": w_product_click,
+        "w_decision_depth": w_decision_depth,
+        "w_conversion": w_conversion,
+        "w_return_penalty": w_return_penalty,
+        "exploration_ratio": exploration_ratio,
+        "adaptation_speed": adaptation_speed,
+        "template_arbitrage_tendency": template_arbitrage_tendency,
+        "user_trust_sensitivity": user_trust_sensitivity,
+        "rounds": rounds,
+    }
+
+    if st.button("运行策略沙盘模拟", type="primary", width="stretch", key="run_content_game"):
+        st.session_state["content_game_has_run"] = True
+
+    if not st.session_state.get("content_game_has_run"):
+        st.info("选择一个平台激励预设后，点击“运行策略沙盘模拟”查看创作者策略份额和生态指标变化。")
+        return
+
+    result = simulate_content_game(df, filters=filters, params=params)
+    strategy_history = result["strategy_history"]
+    ecosystem_history = result["ecosystem_history"]
+    quadrant_history = result["quadrant_history"]
+    payoff_history = result["payoff_history"]
+
+    st.subheader("沙盘核心结果")
+    first_eco = ecosystem_history.iloc[0]
+    last_eco = ecosystem_history.iloc[-1]
+    metric_cols = st.columns(4)
+    metric_cols[0].metric(
+        "用户信任指数",
+        f"{last_eco['trust_index']:.3f}",
+        f"{last_eco['trust_index'] - first_eco['trust_index']:+.3f}",
+    )
+    metric_cols[1].metric(
+        "搜索成本指数",
+        f"{last_eco['search_cost_index']:.3f}",
+        f"{last_eco['search_cost_index'] - first_eco['search_cost_index']:+.3f}",
+    )
+    metric_cols[2].metric(
+        "曝光错配率",
+        f"{last_eco['exposure_mismatch_rate']:.3f}",
+        f"{last_eco['exposure_mismatch_rate'] - first_eco['exposure_mismatch_rate']:+.3f}",
+    )
+    metric_cols[3].metric(
+        "平台综合收益",
+        f"{last_eco['platform_payoff']:.3f}",
+        f"{last_eco['platform_payoff'] - first_eco['platform_payoff']:+.3f}",
+    )
+
+    st.subheader("创作者策略份额演化")
+    fig_strategy = px.line(
+        strategy_history,
+        x="round",
+        y="share",
+        color="strategy",
+        markers=True,
+        labels={"round": "模拟轮次", "share": "策略份额", "strategy": "内容策略"},
+    )
+    fig_strategy.update_layout(height=420, yaxis_tickformat=".0%")
+    st.plotly_chart(fig_strategy, width="stretch")
+
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        st.subheader("平台与用户生态指标")
+        eco_long = ecosystem_history.melt(
+            id_vars="round",
+            value_vars=["trust_index", "search_cost_index", "exposure_mismatch_rate", "platform_payoff"],
+            var_name="metric",
+            value_name="value",
+        )
+        metric_names = {
+            "trust_index": "用户信任指数",
+            "search_cost_index": "搜索成本指数",
+            "exposure_mismatch_rate": "曝光错配率",
+            "platform_payoff": "平台综合收益",
+        }
+        eco_long["metric"] = eco_long["metric"].map(metric_names)
+        fig_eco = px.line(
+            eco_long,
+            x="round",
+            y="value",
+            color="metric",
+            markers=True,
+            labels={"round": "模拟轮次", "value": "指标值", "metric": "指标"},
+        )
+        fig_eco.update_layout(height=390)
+        st.plotly_chart(fig_eco, width="stretch")
+
+    with chart_cols[1]:
+        st.subheader("四象限结构变化")
+        fig_quadrant = px.area(
+            quadrant_history,
+            x="round",
+            y="share",
+            color="quadrant",
+            labels={"round": "模拟轮次", "share": "象限占比", "quadrant": "象限"},
+        )
+        fig_quadrant.update_layout(height=390, yaxis_tickformat=".0%")
+        st.plotly_chart(fig_quadrant, width="stretch")
+
+    st.subheader("策略收益与规则参数")
+    final_payoff = (
+        payoff_history[payoff_history["round"] == payoff_history["round"].max()]
+        .sort_values("payoff", ascending=False)
+        .round({"payoff": 4, "share": 4})
+    )
+    st.dataframe(final_payoff, width="stretch", hide_index=True)
+
+    param_table = pd.DataFrame([params]).T.reset_index()
+    param_table.columns = ["参数", "当前值"]
+    st.dataframe(param_table, width="stretch", hide_index=True)
+
+
 def render_diagnosis_block(diagnosis: dict, rule_based: bool = False) -> None:
     title = "规则版诊断" if rule_based else "GPT 动态诊断"
     st.subheader(title)
@@ -287,7 +440,9 @@ def render_routed_result(question: str, route: dict, df: pd.DataFrame, enable_gp
     else:
         render_diagnosis_block(build_rule_diagnosis(analysis_result), rule_based=True)
 
-    render_decision_value_matrix(df, analysis_result.get("filters_used", filters))
+    active_filters = analysis_result.get("filters_used", filters)
+    render_decision_value_matrix(df, active_filters)
+    render_content_game_sandbox(df, active_filters)
 
 
 def set_example_question(example: str) -> None:
@@ -368,7 +523,17 @@ def main() -> None:
     if st.button("开始分析", type="primary", width="stretch"):
         question = st.session_state["business_question"].strip()
         route = route_question(question, df=df)
-        render_routed_result(question, route, df, enable_gpt)
+        st.session_state["last_question"] = question
+        st.session_state["last_route"] = route
+        st.session_state["content_game_has_run"] = False
+
+    if st.session_state.get("last_question") and st.session_state.get("last_route"):
+        render_routed_result(
+            st.session_state["last_question"],
+            st.session_state["last_route"],
+            df,
+            enable_gpt,
+        )
 
     with st.expander("原始数据浏览：前 50 行"):
         st.dataframe(df.head(50), width="stretch")
